@@ -149,11 +149,8 @@ func (server *Server) sendLoginSnomask(nickMask, accountName string) {
 // to indicate that it should be removed from the list
 func acceptHandler(server *Server, client *Client, msg ircmsg.Message, rb *ResponseBuffer) bool {
 	for _, tNick := range strings.Split(msg.Params[0], ",") {
-		add := true
-		if strings.HasPrefix(tNick, "-") {
-			add = false
-			tNick = strings.TrimPrefix(tNick, "-")
-		}
+		tNick, negPrefix := strings.CutPrefix(tNick, "-")
+		add := !negPrefix
 
 		target := server.clients.Get(tNick)
 		if target == nil {
@@ -719,7 +716,7 @@ func chathistoryHandler(server *Server, client *Client, msg ircmsg.Message, rb *
 				for _, target := range targets {
 					name := server.UnfoldName(target.CfName)
 					rb.Add(nil, server.name, "CHATHISTORY", "TARGETS", name,
-						target.Time.Format(IRCv3TimestampFormat))
+						target.Time.Format(utils.IRCv3TimestampFormat))
 				}
 			} else if channel != nil {
 				channel.replayHistoryItems(rb, items, true)
@@ -754,7 +751,7 @@ func chathistoryHandler(server *Server, client *Client, msg ircmsg.Message, rb *
 			msgid, err = history.NormalizeMsgid(value), nil
 			return
 		} else if identifier == "timestamp" {
-			timestamp, err = time.Parse(IRCv3TimestampFormat, value)
+			timestamp, err = time.Parse(utils.IRCv3TimestampFormat, value)
 			if err == nil {
 				timestamp = timestamp.UTC()
 				if timestamp.Before(unixEpoch) {
@@ -2910,9 +2907,21 @@ func quitHandler(server *Server, client *Client, msg ircmsg.Message, rb *Respons
 
 // REGISTER < account | * > < email | * > <password>
 func registerHandler(server *Server, client *Client, msg ircmsg.Message, rb *ResponseBuffer) (exiting bool) {
-	accountName := client.Nick()
-	if accountName == "*" {
+	var accountName string
+	if client.registered {
+		accountName = client.Nick()
+	} else {
 		accountName = client.preregNick
+	}
+
+	config := server.Config()
+	if client.registered && config.Accounts.NickReservation.ForceGuestFormat {
+		matches := config.Accounts.NickReservation.guestRegexp.FindStringSubmatch(accountName)
+		if matches == nil || len(matches) < 2 {
+			rb.Add(nil, server.name, "FAIL", "REGISTER", "INVALID_USERNAME", utils.SafeErrorParam(accountName), client.t("Username invalid or not given"))
+			return
+		}
+		accountName = matches[1]
 	}
 
 	switch msg.Params[0] {
@@ -2931,7 +2940,6 @@ func registerHandler(server *Server, client *Client, msg ircmsg.Message, rb *Res
 		return
 	}
 
-	config := server.Config()
 	if !config.Accounts.Registration.Enabled {
 		rb.Add(nil, server.name, "FAIL", "REGISTER", "DISALLOWED", accountName, client.t("Account registration is disabled"))
 		return
@@ -2977,7 +2985,7 @@ func registerHandler(server *Server, client *Client, msg ircmsg.Message, rb *Res
 			announcePendingReg(client, rb, accountName)
 		}
 	case errAccountAlreadyRegistered, errAccountAlreadyUnregistered, errAccountMustHoldNick:
-		rb.Add(nil, server.name, "FAIL", "REGISTER", "USERNAME_EXISTS", accountName, client.t("Username is already registered or otherwise unavailable"))
+		rb.Add(nil, server.name, "FAIL", "REGISTER", "ACCOUNT_EXISTS", accountName, client.t("Username is already registered or otherwise unavailable"))
 	case errAccountBadPassphrase:
 		rb.Add(nil, server.name, "FAIL", "REGISTER", "INVALID_PASSWORD", accountName, client.t("Password was invalid"))
 	default:
@@ -3055,14 +3063,14 @@ func markReadHandler(server *Server, client *Client, msg ircmsg.Message, rb *Res
 
 	// "MARKREAD client set command": MARKREAD <target> <timestamp>
 	readTimestamp := strings.TrimPrefix(msg.Params[1], "timestamp=")
-	readTime, err := time.Parse(IRCv3TimestampFormat, readTimestamp)
+	readTime, err := time.Parse(utils.IRCv3TimestampFormat, readTimestamp)
 	if err != nil {
 		rb.Add(nil, server.name, "FAIL", "MARKREAD", "INVALID_PARAMS", utils.SafeErrorParam(readTimestamp), client.t("Invalid timestamp"))
 		return
 	}
 	readTime = readTime.UTC()
 	result := client.SetReadMarker(cftarget, readTime)
-	readTimestamp = fmt.Sprintf("timestamp=%s", result.Format(IRCv3TimestampFormat))
+	readTimestamp = fmt.Sprintf("timestamp=%s", result.Format(utils.IRCv3TimestampFormat))
 	// inform the originating session whether it was a success or a no-op:
 	rb.Add(nil, server.name, "MARKREAD", unfoldedTarget, readTimestamp)
 	if result.Equal(readTime) {
@@ -4118,9 +4126,9 @@ func zncHandler(server *Server, client *Client, msg ircmsg.Message, rb *Response
 // fake handler for unknown commands
 func unknownCommandHandler(server *Server, client *Client, msg ircmsg.Message, rb *ResponseBuffer) bool {
 	var message string
-	if strings.HasPrefix(msg.Command, "/") {
+	if trimmedCmd, initialSlash := strings.CutPrefix(msg.Command, "/"); initialSlash {
 		message = fmt.Sprintf(client.t("Unknown command; if you are using /QUOTE, the correct syntax is /QUOTE %[1]s, not /QUOTE %[2]s"),
-			strings.TrimPrefix(msg.Command, "/"), msg.Command)
+			trimmedCmd, msg.Command)
 	} else {
 		message = client.t("Unknown command")
 	}
